@@ -29,13 +29,15 @@ var ValidTopicSuffixMethods = []string{
 var zeroTime = time.Unix(0, 0)
 
 type Kafka struct {
-	Brokers         []string    `toml:"brokers"`
-	Topic           string      `toml:"topic"`
-	TopicTag        string      `toml:"topic_tag"`
-	ExcludeTopicTag bool        `toml:"exclude_topic_tag"`
-	TopicSuffix     TopicSuffix `toml:"topic_suffix"`
-	RoutingTag      string      `toml:"routing_tag"`
-	RoutingKey      string      `toml:"routing_key"`
+	Brokers               []string    `toml:"brokers"`
+	Topic                 string      `toml:"topic"`
+	TopicTag              string      `toml:"topic_tag"`
+	ExcludeTopicTag       bool        `toml:"exclude_topic_tag"`
+	TopicSuffix           TopicSuffix `toml:"topic_suffix"`
+	RoutingTag            string      `toml:"routing_tag"`
+	RoutingKey            string      `toml:"routing_key"`
+	ValidateTopics        bool        `toml:"validate_topics"`
+	ValidationIntervalSec int         `toml:"validation_interval_sec"`
 
 	proxy.Socks5ProxyConfig
 
@@ -56,6 +58,9 @@ type Kafka struct {
 	producer     sarama.SyncProducer
 
 	serializer serializers.Serializer
+
+	topicList map[string]struct{}
+	quit      chan struct{}
 }
 
 type TopicSuffix struct {
@@ -168,6 +173,27 @@ func (k *Kafka) Init() error {
 		config.Net.Proxy.Dialer = dialer
 	}
 
+	if k.ValidateTopics {
+		k.listTopics()
+		interval := k.ValidationIntervalSec
+		if interval < 1 {
+			interval = 300
+		}
+		ticker := time.NewTicker(time.Duration(interval) * time.Second)
+		k.quit = make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-ticker.C:
+					k.listTopics()
+				case <-k.quit:
+					ticker.Stop()
+					return
+				}
+			}
+		}()
+	}
+
 	return nil
 }
 
@@ -182,6 +208,31 @@ func (k *Kafka) Connect() error {
 
 func (k *Kafka) Close() error {
 	return k.producer.Close()
+}
+
+func (k *Kafka) listTopics() {
+	admin, err := sarama.NewClusterAdmin(k.Brokers, k.saramaConfig)
+	if err != nil {
+		k.Log.Errorf("Error while creating admin client: %v", err)
+	}
+
+	topics, err := admin.ListTopics()
+	if err != nil {
+		k.Log.Errorf("Error while listing topics: %v", err)
+	}
+
+	topicList := make(map[string]struct{})
+
+	for topic, _ := range topics {
+		topicList[topic] = struct{}{}
+	}
+
+	k.topicList = topicList
+
+	err = admin.Close()
+	if err != nil {
+		k.Log.Errorf("Error while closing admin client: %v", err)
+	}
 }
 
 func (k *Kafka) routingKey(metric telegraf.Metric) (string, error) {
@@ -207,6 +258,14 @@ func (k *Kafka) Write(metrics []telegraf.Metric) error {
 	msgs := make([]*sarama.ProducerMessage, 0, len(metrics))
 	for _, metric := range metrics {
 		metric, topic := k.GetTopicName(metric)
+
+		if k.ValidateTopics && len(k.topicList) > 0 {
+			if _, ok := k.topicList[topic]; !ok {
+				// topic doesn't exist in Kafka
+				k.Log.Debugf("Topic '%s' doesn't exist in Kafka, skipping message.", topic)
+				continue
+			}
+		}
 
 		buf, err := k.serializer.Serialize(metric)
 		if err != nil {

@@ -22,7 +22,7 @@ type topicSuffixTestpair struct {
 	expectedTopic string
 }
 
-func TestConnectAndWriteIntegration(t *testing.T) {
+func TestConnectWriteAndListtopicIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -61,7 +61,7 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 			"KAFKA_ADVERTISED_HOST_NAME": "localhost",
 			"KAFKA_ADVERTISED_PORT":      "9092",
 			"KAFKA_ZOOKEEPER_CONNECT":    fmt.Sprintf("telegraf-test-zookeeper:%s", zookeeper.Ports["2181"]),
-			"KAFKA_CREATE_TOPICS":        "Test:1:1",
+			"KAFKA_CREATE_TOPICS":        "Test:1:1,Test2:1:1",
 		},
 		Networks:   []string{networkName},
 		WaitingFor: wait.ForLog("Log loaded for partition Test-0 with initial high watermark 0"),
@@ -78,16 +78,19 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 
 	s, _ := serializers.NewInfluxSerializer()
 	k := &Kafka{
-		Brokers:      brokers,
-		Topic:        "Test",
-		Log:          testutil.Logger{},
-		serializer:   s,
-		producerFunc: sarama.NewSyncProducer,
+		Brokers:               brokers,
+		Topic:                 "Test",
+		Log:                   testutil.Logger{},
+		serializer:            s,
+		producerFunc:          sarama.NewSyncProducer,
+		ValidateTopics:        true,
+		ValidationIntervalSec: 4,
 	}
 
 	// Verify that we can connect to the Kafka broker
 	err = k.Init()
 	require.NoError(t, err)
+	require.Equal(t, 2, len(k.topicList))
 	err = k.Connect()
 	require.NoError(t, err)
 
@@ -96,6 +99,18 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 	require.NoError(t, err)
 	err = k.Close()
 	require.NoError(t, err)
+
+	config := sarama.NewConfig()
+	err = k.SetConfig(config)
+	require.NoError(t, err)
+
+	admin, err := sarama.NewClusterAdmin(brokers, config)
+	require.NoError(t, err)
+	err = admin.CreateTopic("Test3", &sarama.TopicDetail{NumPartitions: 1, ReplicationFactor: 1}, false)
+	require.NoError(t, err)
+
+	time.Sleep(4 * time.Second)
+	require.Equal(t, 3, len(k.topicList))
 }
 
 func TestTopicSuffixes(t *testing.T) {
