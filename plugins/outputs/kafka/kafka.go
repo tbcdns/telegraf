@@ -207,6 +207,9 @@ func (k *Kafka) Connect() error {
 }
 
 func (k *Kafka) Close() error {
+	if k.ValidateTopics {
+		k.quit <- struct{}{}
+	}
 	return k.producer.Close()
 }
 
